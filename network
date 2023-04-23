@@ -1,0 +1,324 @@
+##########################################################################
+class CA(nn.Module):
+    def __init__(self, channel, reduction=16, bias=False):
+        super(CA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
+            nn.PReLU(),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
+
+
+##########################################################################
+class RCA(nn.Module):
+    def __init__(self, channel):
+        super(RCA, self).__init__()
+        self.dilation_conv = nn.Sequential(
+            nn.Conv2d(channel, channel, 3, 1, 1, dilation=1),
+            nn.PReLU(),
+            nn.Conv2d(channel, channel, 3, 1, 2, dilation=2),
+            nn.PReLU(),
+            nn.Conv2d(channel, channel, 3, 1, 5, dilation=5),
+            nn.PReLU(),
+        )
+        self.RCA_att = CA(channel)
+
+    def forward(self, x):
+        x_dilation = self.dilation_conv(x)
+        y = self.RCA_att(x_dilation)
+        return x + y
+
+
+##########################################################################
+class SFFM(nn.Module):
+    def __init__(self, channel):
+        super(SFFM, self).__init__()
+        self.SFFM_att = CA(channel)
+        self.tail = nn.Sequential(nn.Conv2d(channel, 3, 3, 1, 1), nn.ReLU(inplace=True))
+
+    def forward(self, stage_combine):
+        SFFM_H = stage_combine.size(2)
+        SFFM_W = stage_combine.size(3)
+
+        stage_img_top = stage_combine[:, :, 0:int(SFFM_H / 4), :]
+        stage_img_middle = stage_combine[:, :, int(SFFM_H / 4):int(SFFM_H * 0.75), :]
+        stage_img_bot = stage_combine[:, :, int(SFFM_H * 0.75):SFFM_H, :]
+
+        ltop_img = stage_img_top[:, :, :, 0:int(SFFM_W / 4)]
+        mtop_img = stage_img_top[:, :, :, int(SFFM_W / 4):int(SFFM_W * 0.75)]
+        rtop_img = stage_img_top[:, :, :, int(SFFM_W * 0.75):SFFM_W]
+
+        lmiddle_img = stage_img_middle[:, :, :, 0:int(SFFM_W / 4)]
+        mmiddle_img = stage_img_middle[:, :, :, int(SFFM_W / 4):int(SFFM_W * 0.75)]
+        rmiddle_img = stage_img_middle[:, :, :, int(SFFM_W * 0.75):SFFM_W]
+
+        lbot_img = stage_img_bot[:, :, :, 0:int(SFFM_W / 4)]
+        mbot_img = stage_img_bot[:, :, :, int(SFFM_W / 4):int(SFFM_W * 0.75)]
+        rbot_img = stage_img_bot[:, :, :, int(SFFM_W * 0.75):SFFM_W]
+
+        ltop_feat = self.SFFM_att(ltop_img)
+        mtop_feat = self.SFFM_att(mtop_img)
+        rtop_feat = self.SFFM_att(rtop_img)
+
+        lmiddle_feat = self.SFFM_att(lmiddle_img)
+        mmiddle_feat = self.SFFM_att(mmiddle_img)
+        rmiddle_feat = self.SFFM_att(rmiddle_img)
+
+        lbot_feat = self.SFFM_att(lbot_img)
+        mbot_feat = self.SFFM_att(mbot_img)
+        rbot_feat = self.SFFM_att(rbot_img)
+
+        feat_top = torch.cat([ltop_feat, mtop_feat, rtop_feat], 3)
+        feat_middle = torch.cat([lmiddle_feat, mmiddle_feat, rmiddle_feat], 3)
+        feat_bot = torch.cat([lbot_feat, mbot_feat, rbot_feat], 3)
+
+        SFFM_feat = torch.cat([feat_top, feat_middle, feat_bot], 2)
+
+        stage_img_next = stage_combine + SFFM_feat
+        stage_img_out = self.tail(SFFM_feat)
+
+        return stage_img_next, stage_img_out
+
+
+##########################################################################
+class ResnetBlock(nn.Module):
+    def __init__(self, dim):
+        super(ResnetBlock, self).__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1, dilation=1),
+            nn.InstanceNorm2d(dim, track_running_stats=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 2, dilation=2),
+            nn.InstanceNorm2d(dim, track_running_stats=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 5, dilation=5),
+            nn.InstanceNorm2d(dim, track_running_stats=False),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        out = x + self.conv_block(x)
+        return out
+
+
+##########################################################################
+class Encoder(nn.Module):
+    def __init__(self, in_channels, out_channels, res_num=4):
+        super(Encoder, self).__init__()
+        self.down12 = nn.Sequential(nn.Conv2d(in_channels, 128, 3, 2, 1), nn.ReLU(inplace=True))
+        self.down23 = nn.Sequential(nn.Conv2d(128, out_channels, 3, 2, 1), nn.ReLU(inplace=True))
+
+        self.encoder_level01 = nn.Sequential(nn.Conv2d(64, 64, 3, 1, 1), nn.ReLU(inplace=True))
+        self.encoder_level12 = nn.Sequential(nn.Conv2d(128, 128, 3, 1, 1), nn.ReLU(inplace=True))
+        self.encoder_level23 = nn.Sequential(nn.Conv2d(256, 256, 3, 1, 1), nn.ReLU(inplace=True))
+
+        blocks = []
+        for _ in range(res_num):
+            block = ResnetBlock(256)
+            blocks.append(block)
+
+        self.middle = nn.Sequential(*blocks)
+
+    def forward(self, x):
+        x = self.encoder_level01(x)
+
+        enc1 = x
+
+        x = self.down12(x)
+
+        x = self.encoder_level12(x)
+        enc2 = x
+
+        x = self.down23(x)
+
+        x = self.encoder_level23(x)
+        enc3 = x
+
+        refine_feature = self.middle(x)
+
+        return [enc1, enc2, enc3, refine_feature]
+
+
+##########################################################################
+class Decoder(nn.Module):
+    def __init__(self, in_channels, out_channels, fi=False):
+        super(Decoder, self).__init__()
+        self.up32 = nn.Sequential(nn.ConvTranspose2d(in_channels, 128, 4, 2, 1), nn.ReflectionPad2d((1, 0, 1, 0)),
+                                  nn.AvgPool2d(2, stride=1), nn.ReLU(inplace=True))
+        self.up21 = nn.Sequential(nn.ConvTranspose2d(128, out_channels, 4, 2, 1), nn.ReflectionPad2d((1, 0, 1, 0)),
+                                  nn.AvgPool2d(2, stride=1), nn.ReLU(inplace=True))
+
+        self.decoder_level32 = nn.Sequential(nn.Conv2d(256, 256, 3, 1, 1), nn.ReLU(inplace=True))
+        self.decoder_level21 = nn.Sequential(nn.Conv2d(128, 128, 3, 1, 1), nn.ReLU(inplace=True))
+        self.decoder_level10 = nn.Sequential(nn.Conv2d(64, 64, 3, 1, 1), nn.ReLU(inplace=True))
+
+        self.skipconnection3 = nn.Sequential(nn.Conv2d(256, 256, 3, 1, 1), nn.PReLU())
+        self.skipconnection2 = nn.Sequential(nn.Conv2d(128, 128, 3, 1, 1), nn.PReLU())
+        self.skipconnection1 = nn.Sequential(nn.Conv2d(64, 64, 3, 1, 1), nn.PReLU())
+
+        if fi:
+            self.fi_enc3 = RCA(256)
+            self.fi_enc2 = RCA(128)
+            self.fi_enc1 = RCA(64)
+
+        kernel = np.ones([5, 5]) * (1 / 25)
+        kernel1 = torch.FloatTensor(kernel).expand(256, 1, 5, 5)
+        kernel2 = torch.FloatTensor(kernel).expand(128, 1, 5, 5)
+        kernel3 = torch.FloatTensor(kernel).expand(64, 1, 5, 5)
+        self.weight1 = nn.Parameter(data=kernel1, requires_grad=False)
+        self.weight2 = nn.Parameter(data=kernel2, requires_grad=False)
+        self.weight3 = nn.Parameter(data=kernel3, requires_grad=False)
+
+    def forward(self, outs, encoder1_outs=None, encoder2_outs=None):
+        enc1, enc2, enc3, refine_feature = outs
+        dec3 = refine_feature + self.skipconnection3(enc3)
+        if (encoder1_outs is not None) and (encoder2_outs is None):
+            att_low_11 = self.fi_enc3(encoder1_outs[2])
+            gauss_low_11 = torch.nn.functional.conv2d(att_low_11, self.weight1, padding=2, groups=256)
+            dec3 = dec3 + gauss_low_11
+
+        elif (encoder1_outs is not None) and (encoder2_outs is not None):
+            att_low_12 = self.fi_enc3(encoder1_outs[2] + encoder2_outs[2])
+            gauss_low_12 = torch.nn.functional.conv2d(att_low_12, self.weight1, padding=2, groups=256)
+            dec3 = dec3 + gauss_low_12
+        dec3 = self.decoder_level32(dec3)
+
+        dec2 = self.up32(dec3)
+
+        dec2 = dec2 + self.skipconnection2(enc2)
+        if (encoder1_outs is not None) and (encoder2_outs is None):
+            att_low_21 = self.fi_enc2(encoder1_outs[1])
+            gauss_low_21 = torch.nn.functional.conv2d(att_low_21, self.weight2, padding=2, groups=128)
+            dec2 = dec2 + gauss_low_21
+
+        elif (encoder1_outs is not None) and (encoder2_outs is not None):
+            att_low_22 = self.fi_enc2(encoder1_outs[1] + encoder2_outs[1])
+            gauss_low_22 = torch.nn.functional.conv2d(att_low_22, self.weight2, padding=2, groups=128)
+            dec2 = dec2 + gauss_low_22
+        dec2 = self.decoder_level21(dec2)
+
+        dec1 = self.up21(dec2)
+
+        dec1 = dec1 + self.skipconnection1(enc1)
+        if (encoder1_outs is not None) and (encoder2_outs is None):
+            att_low_31 = self.fi_enc1(encoder1_outs[0])
+            gauss_low_31 = torch.nn.functional.conv2d(att_low_31, self.weight3, padding=2, groups=64)
+            dec1 = dec1 + gauss_low_31
+
+        elif (encoder1_outs is not None) and (encoder2_outs is not None):
+            att_low_32 = self.fi_enc1(encoder1_outs[0] + encoder2_outs[0])
+            gauss_low_32 = torch.nn.functional.conv2d(att_low_32, self.weight3, padding=2, groups=64)
+            dec1 = dec1 + gauss_low_32
+        dec1 = self.decoder_level10(dec1)
+
+        return [dec1, dec2, dec3]
+
+
+##########################################################################
+class Generator_drop(torch.nn.Module):
+    def __init__(self, in_channels=3, out_channels=3):
+        super(Generator_drop, self).__init__()
+
+        self.shallow_feat1 = nn.Sequential(nn.Conv2d(in_channels, 64, 3, 1, 1), nn.ReLU(inplace=True))
+        self.shallow_feat2 = nn.Sequential(nn.Conv2d(in_channels, 64, 3, 1, 1), nn.ReLU(inplace=True))
+        self.shallow_feat3 = nn.Sequential(nn.Conv2d(in_channels, 64, 3, 1, 1), nn.ReLU(inplace=True))
+
+        self.stage1_encoder = Encoder(64, 256)
+        self.stage1_decoder = Decoder(256, 64, fi=False)
+
+        self.stage2_encoder = Encoder(64, 256)
+        self.stage2_decoder = Decoder(256, 64, fi=True)
+
+        self.stage3_encoder = Encoder(64, 256)
+        self.stage3_decoder = Decoder(256, 64, fi=True)
+
+        self.SFFM = SFFM(64)
+
+        self.concat12 = nn.Sequential(nn.Conv2d(2 * 64, 64, 3, 1, 1), nn.ReLU(inplace=True))
+        self.concat23 = nn.Sequential(nn.Conv2d(2 * 64, 64, 3, 1, 1), nn.ReLU(inplace=True))
+
+        self.output = nn.Sequential(nn.Conv2d(64, out_channels, 3, 1, 1), nn.ReLU(inplace=True))
+
+        self.outframe2 = nn.Sequential(nn.Conv2d(128, out_channels, 3, 1, 1), nn.ReLU(inplace=True))
+        self.outframe4 = nn.Sequential(nn.Conv2d(256, out_channels, 3, 1, 1), nn.ReLU(inplace=True))
+
+    def forward(self, x3_img):
+        H = x3_img.size(2)
+        W = x3_img.size(3)
+
+        x2top_img = x3_img[:, :, 0:int(H / 2), :]
+        x2bot_img = x3_img[:, :, int(H / 2):H, :]
+
+        ## Four Patches for Stage 1
+        x1ltop_img = x2top_img[:, :, :, 0:int(W / 2)]
+        x1rtop_img = x2top_img[:, :, :, int(W / 2):W]
+        x1lbot_img = x2bot_img[:, :, :, 0:int(W / 2)]
+        x1rbot_img = x2bot_img[:, :, :, int(W / 2):W]
+
+        ##-------------------------------------------
+        ##-------------- Stage 1---------------------
+        ##-------------------------------------------
+        x1ltop_feat = self.shallow_feat1(x1ltop_img)
+        x1rtop_feat = self.shallow_feat1(x1rtop_img)
+        x1lbot_feat = self.shallow_feat1(x1lbot_img)
+        x1rbot_feat = self.shallow_feat1(x1rbot_img)
+
+        feat1_ltop = self.stage1_encoder(x1ltop_feat)
+        feat1_rtop = self.stage1_encoder(x1rtop_feat)
+        feat1_lbot = self.stage1_encoder(x1lbot_feat)
+        feat1_rbot = self.stage1_encoder(x1rbot_feat)
+
+        feat1_top = [torch.cat((k, v), 3) for k, v in zip(feat1_ltop, feat1_rtop)]
+        feat1_bot = [torch.cat((k, v), 3) for k, v in zip(feat1_lbot, feat1_rbot)]
+        feat1 = [torch.cat((k, v), 2) for k, v in zip(feat1_top, feat1_bot)]
+
+        res1_top = self.stage1_decoder(feat1_top)
+        res1_bot = self.stage1_decoder(feat1_bot)
+
+        stage1_img = torch.cat([res1_top[0], res1_bot[0]], 2)
+        stage1_img_next, stage1_img_out = self.SFFM(stage1_img)
+
+        stage1_topimg_next = stage1_img_next[:, :, 0:int(H / 2), :]
+        stage1_botimg_next = stage1_img_next[:, :, int(H / 2):H, :]
+        ##-------------------------------------------
+        ##-------------- Stage 2---------------------
+        ##-------------------------------------------
+
+        x2top_feat = self.shallow_feat2(x2top_img)
+        x2bot_feat = self.shallow_feat2(x2top_img)
+        x2top_cat = self.concat12(torch.cat([x2top_feat, stage1_topimg_next], 1))
+        x2bot_cat = self.concat12(torch.cat([x2bot_feat, stage1_botimg_next], 1))
+
+        feat2_top = self.stage2_encoder(x2top_cat)
+        feat2_bot = self.stage2_encoder(x2bot_cat)
+
+        feat2 = [torch.cat((k, v), 2) for k, v in zip(feat2_top, feat2_bot)]
+
+        res2 = self.stage2_decoder(feat2, encoder1_outs=feat1)
+
+        stage2_img_next, stage2_img_out = self.SFFM(res2[0])
+
+        ##-------------------------------------------
+        ##-------------- Stage 3---------------------
+        ##-------------------------------------------
+        x3_feat = self.shallow_feat3(x3_img)
+        x3_cat = self.concat23(torch.cat([x3_feat, stage2_img_next], 1))
+
+        feat3 = self.stage3_encoder(x3_cat)
+
+        res3 = self.stage3_decoder(feat3, encoder1_outs=feat1, encoder2_outs=feat2)
+
+        stage3_img_out = self.output(res3[0])
+
+        frame2 = self.outframe2(res3[1])
+        frame4 = self.outframe4(res3[2])
+
+        return stage1_img_out, stage2_img_out, stage3_img_out, frame2, frame4
+
